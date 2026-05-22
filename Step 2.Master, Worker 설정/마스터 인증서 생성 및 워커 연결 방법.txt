@@ -1,0 +1,32 @@
+# 쿠버네티스 구동에 필요한 핵심 컨테이너 이미지들 인터넷(Bastion NAT 경유)에서 다운로드
+1. sudo kubeadm init --apiserver-advertise-address=192.168.0.20 --pod-network-cidr=172.16.0.0/16
+
+2. mkdir -p $HOME/.kube
+3. sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+4. sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# 충돌 없는 대역으로 kubeadm init 실행
+5. sudo kubeadm init --apiserver-advertise-address=192.168.0.20 --pod-network-cidr=172.16.0.0/16
+
+# Master 노드 kubectl 환경 설정
+6. mkdir -p $HOME/.kube
+7. sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+8. sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Master 노드 CNI 네트워크 플러그인 설치
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml (Calico Operator 설치)
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml (Calico 설정 파일 다운)
+sed -i 's/192.168.0.0\/16/172.16.0.0\/16/g' custom-resources.yaml (설정 파일 내의 기본 IP 대역(172.16.0.0)으로 변경)
+kubectl create -f custom-resources.yaml
+kubectl get pods -n calico-system
+
+# 방법 1. 전체 조인(Join) 명령어 한 번에 뽑아내기 (추천)
+kubeadm token create --print-join-command
+
+# 방법 2. 토큰, 해시값 출력
+kubeadm token list
+openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+
+# Worker 노드들 Master 노드 연결
+sudo kubeadm join 192.168.0.20:6443 --token 3wmv6p.iq94mh4mhx3pwet7 --discovery-token-ca-cert-hash sha256:a6564fb82f9687aec739ebad209fdb4bb3b3b573251878bbd265727109f3333e
+kubectl get nodes

@@ -1,0 +1,22 @@
+# IP 포워딩 활성화 -> 리눅스 커널 네트워크 패킷을 다른 인터페이스로 넘길 수 있도록 허용.
+
+1. echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf (설정 파일에 포워딩 룰 추가)
+2. sudo sysctl -p (설정 즉시 적용)
+3. cat /proc/sys/net/ipv4/ip_forward (IP 포워딩 확인)
+
+# iptables를 이용한 IP 마스커레이딩(NAT) 적용 -> 내부망에서 들어온 트래픽 출발지 IP를 Infra VM의 외부망 IP로 변조하여 내보냄.
+
+1. sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE (eth0 통해 나가는 트래픽 NAT 적용 (eth0 부분은 실제 외부망 인터페이스 이름으로 변경))
+2. sudo iptables -t nat -L POSTROUTING -v -n (규칙 확인)
+
+# Git 설치
+
+1. sudo apt update
+2. sudo apt install -y git
+
+
+# kubectl 설치
+
+1. curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" (최신 릴리즈 버전 다운로드)
+2. sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl (다운로드한 바이너리에 실행 권한 부여 및 시스템 경로로 이동)
+3. kubectl version --client (설치 확인)

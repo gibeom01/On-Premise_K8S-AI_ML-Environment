@@ -1,0 +1,26 @@
+# Provisioner 배포
+1. kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.28/deploy/local-path-storage.yaml
+2. kubectl get pods -n local-path-storage
+3. kubectl get sc
+
+# 기본(Default) 스토리지 클래스 지정
+4. kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+또는 edit으로 storageclass.kubernetes.io/is-default-class: "false" -> "ture" 수정.
+5. kubectl get sc
+
+# 스토리지 동작 테스트
+6. cat <<EOF > pvc-test.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-path-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+EOF
+7. kubectl apply -f pvc-test.yaml
+8. kubectl get pvc

@@ -1,0 +1,91 @@
+# MinIO 통합 매니페스트 파일 작성
+
+1. cat <<EOF > minio-standalone.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minio-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: minio-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: minio-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:latest
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - minio server /data --console-address ":9001"
+        env:
+        - name: MINIO_ROOT_USER
+          value: "admin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "Admin1234!"
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: minio-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+  namespace: minio-system
+spec:
+  type: NodePort
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900
+    - name: console
+      port: 9001
+      targetPort: 9001
+      nodePort: 30901
+EOF
+
+# 매니페스트 적용 및 배포, 확인
+
+1. kubectl apply -f minio-standalone.yaml
+2. kubectl get pods -n minio-system
+3. kubectl get pvc -n minio-system
+
+# 접속 테스트 방법 -> 개인 PC(Windows/Mac) 터미널 진행.
+
+1. ssh -L 9001:192.168.0.20:30901 bastion@221.139.104.182
+2. 브라우저 -> http://localhost:9001 접속 -> admin / Admin1234! 로그인.

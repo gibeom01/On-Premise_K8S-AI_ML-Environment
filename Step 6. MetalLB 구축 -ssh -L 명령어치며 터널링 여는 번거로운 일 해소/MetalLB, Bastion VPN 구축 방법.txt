@@ -1,0 +1,74 @@
+# Kube-proxy 설정 변경 (Strict ARP 활성화)
+
+1. kubectl get configmap kube-proxy -n kube-system -o yaml | \
+sed -e "s/strictARP: false/strictARP: true/" | \
+kubectl apply -f - -n kube-system
+2. kubectl rollout restart daemonset kube-proxy -n kube-system (적용 후 kube-proxy 파드들 재시작해 설정 반영)
+
+# MetalLB 핵심 엔진 설치
+
+1. kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+2. watch kubectl get pods -n metallb-system
+
+# 할당할 IP 대역폭(Pool) 설정
+
+1. cat <<EOF > metallb-config.yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  # 아래 IP 대역을 실제 비어있는 대역으로 수정하셔도 됩니다.
+  - 192.168.0.200-192.168.0.220
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - default-pool
+EOF
+
+2. kubectl apply -f metallb-config.yaml
+
+# KFP 대시보드에 LoadBalancer 적용 및 접속 테스트 -> 안되면 다음 진행.
+
+1. kubectl patch svc ml-pipeline-ui -n kubeflow -p '{"spec": {"type": "LoadBalancer"}}'
+2. kubectl get svc ml-pipeline-ui -n kubeflow
+
+# WireGuard 자동화 스크립트 실행 Bastion Host Node
+
+1. curl -O https://raw.githubusercontent.com/Nyr/wireguard-install/master/wireguard-install.sh
+2. chmod +x wireguard-install.sh
+3. sudo ./wireguard-install.sh
+
+Public IPv4/hostname: (Bastion의 공인 IP가 자동으로 잡힙니다. Enter)
+Public interface: (자동으로 잡힙니다. Enter)
+WireGuard port: 51820 (기본값 Enter)
+Client name: my-pc (원하는 이름 입력 후 Enter)
+DNS server: 1 (Current system resolvers 선택 후 Enter)
+
+# Bastion Host 방화벽(포트) 개방
+
+sudo ufw allow 51820/udp
+
+# 설정 파일(conf) 가져오기 및 Split Tunneling 수정
+
+1. cat my-pc.conf -> 화면에 출력된 [Interface]부터 [Peer] 끝까지 복사.
+2. https://www.wireguard.com/install/ -> 주소로 들어가서 PC 운영체제에 맞는 클라이언트 다운로드.
+3. WireGuard 프로그램 -> 좌측 하단의 꺾쇠(v) -> '빈 터널 추가(Add empty tunnel)' 선택 -> 복사해 둔 텍스트 그대로 붙여넣기.
+
+⭐️ [핵심! Split Tunneling 설정] ⭐️
+수정 전: AllowedIPs = 0.0.0.0/0, ::/0
+수정 후: AllowedIPs = 192.168.0.0/24, 10.7.0.0/24
+(K8s 노드 대역폭과, 스크립트가 할당한 VPN 내부 대역폭만 허용한다는 뜻)
+
+4. 이름 K8s-Lab 등으로 지정하고 [저장].
+
+# VPN 연결 및 대망의 로드밸런서 접속 테스트
+
+브라우저 -> http://192.168.0.20:31182 -> KFP UI 접속.

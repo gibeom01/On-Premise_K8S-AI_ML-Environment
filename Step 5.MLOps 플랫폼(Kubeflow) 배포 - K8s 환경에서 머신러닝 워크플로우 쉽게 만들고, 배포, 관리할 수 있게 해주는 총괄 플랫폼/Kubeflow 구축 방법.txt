@@ -1,0 +1,41 @@
+# Kustomize 다운로드 및 설치
+
+1. curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+2. sudo mv kustomize /usr/local/bin/ (시스템 전역에서 사용할 수 있도록 이동)
+
+# KFP Standalone 설치
+
+1. export PIPELINE_VERSION=2.5.0 (KFP 안정화 버전(v2.5.0) 환경변수 설정)
+2. kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=$PIPELINE_VERSION" (클러스터 범위 리소스(CRD) 설치)
+3. sleep 10 (CRD가 완전히 인식될 때까지 10초 대기)
+4. kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/env/dev?ref=$PIPELINE_VERSION" (KFP 코어 엔진 및 대시보드 설치)
+5. kubectl set image deployment/minio minio=minio/minio:RELEASE.2019-08-14T20-37-41Z -n kubeflow (문제의 파드(minio) 도커 허브의 정상 주소로 강제로 틀어주기)
+6. (선택) kubectl scale deployment proxy-agent --replicas=0 -n kubeflow (온프레미스 환경에서 불필요한 proxy-agent 강제 종료)
+
+# Kubeflow 대시보드 접속 -> istio-system 네임스페이스에 있는 istio-ingressgateway 통해서만 외부 접속 허용해, bastion 거쳐 접속해야 함.
+1. kubectl port-forward svc/istio-ingressgateway -n istio-system 8080:80 --address 0.0.0.0 (마스터 노드에서 포트 열기)
+2. ssh -L 8080:192.168.0.20:8080 bastion@221.139.104.182 (개인 PC(Windows/Mac) 터미널에서 터널링)
+3. 브라우저 -> http://localhost:8080 접속 -> user@example.com/12341234 로그인.
+
+---
+
+★ Scale-out 위한 Node 스펙: 16코어 64GB 스펙을 가진 워커 노드를 3개, 4개씩 가로로 연결하여 트래픽과 컨테이너들을 넓게 분산 ★
+★ Node Group 분리 필수 ★
+1. 시스템 노드 그룹 (CPU 위주): Kubeflow의 뼈대인 Istio, DB, 대시보드 파드들만 모아서 띄우는 전용 노드
+2. 학습/추론 노드 그룹 (GPU + 고용량 RAM): 실제 파이프라인이 돌면서 딥러닝 연산(TensorFlow, PyTorch)을 할 때만 파드가 생성되어 GPU를 전력으로 사용하는 전용 노드
+
+# Kubeflow 공식 Manifests 저장소 복제
+
+1. git clone https://github.com/kubeflow/manifests.git
+2. cd manifests
+3. git checkout v1.8-branch (안정화 버전 브랜치로 이동)
+
+# 단일 명령어로 전체 플랫폼 배포 및 확인 -> Kubeflow는 설치해야 할 리소스(CRD)가 너무 많아서, 한 번에 설치하면 의존성 문제로 에러가 발생.
+
+1. while ! kustomize build example | kubectl apply -f -; do echo "Retrying to apply resources..."; sleep 10; done
+2. kubectl get pods -A | grep -e kubeflow -e istio -e auth
+
+# Kubeflow 대시보드 접속 -> istio-system 네임스페이스에 있는 istio-ingressgateway 통해서만 외부 접속 허용해, bastion 거쳐 접속해야 함.
+1. kubectl port-forward svc/istio-ingressgateway -n istio-system 8080:80 --address 0.0.0.0 (마스터 노드에서 포트 열기)
+2. ssh -L 8080:192.168.0.20:8080 bastion@221.139.104.182 (개인 PC(Windows/Mac) 터미널에서 터널링)
+3. 브라우저 -> http://localhost:8080 접속 -> user@example.com/12341234 로그인.

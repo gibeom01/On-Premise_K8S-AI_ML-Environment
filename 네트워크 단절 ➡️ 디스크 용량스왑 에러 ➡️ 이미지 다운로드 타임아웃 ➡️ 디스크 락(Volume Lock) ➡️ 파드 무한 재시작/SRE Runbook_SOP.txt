@@ -1,0 +1,48 @@
+Bastion Node에서 진행
+
+#  IP 포워딩 활성화
+echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+cat /proc/sys/net/ipv4/ip_forward
+
+# iptables를 이용한 IP 마스커레이딩(NAT) 적용
+sudo iptables -t nat -A POSTROUTING -o ens160 -j MASQUERADE
+sudo iptables -t nat -L POSTROUTING -v -n
+
+# iptables 설정 영구 저장 (재부팅 시 자동 적용)
+sudo apt-get install iptables-persistent
+sudo netfilter-persistent save
+
+---
+문제의 Node에서 진행
+
+# Kubelet의 최근 에러 로그 30줄 확인
+journalctl -u kubelet -n 30 --no-pager
+
+# 죽은 워커 노드 색출
+kubectl get nodes
+
+# 문제의 워커 노드에 접속하여 복구
+df -h / (디스크 용량 확인 (Use%가 85% 이상이면 파일 정리 필요))
+sudo swapoff -a (스왑(Swap) 메모리 강제 종료 (재부팅되면서 다시 켜졌을 확률 99%))
+sudo sed -i '/swap/d' /etc/fstab (스왑(Swap) 메모리 영구 비활성화)
+sudo systemctl restart containerd
+sudo systemctl restart kubelet
+
+# DNS 설정 파일(resolv.conf) 덮어쓰기
+sudo bash -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf' (구글 DNS(8.8.8.8)를 최우선으로 바라보도록 강제 설정)
+ping -c 3 google.com
+
+# crictl 명령어 에러 고치기 -> dial unix /var/run/dockershim.sock: connect: no such file or directory 라는 빨간 에러 시
+sudo crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock
+
+# 클러스터 전체의 Terminating 파드 강제 삭제
+kubectl get pods -A | grep Terminating | awk '{print "kubectl delete pod " $2 " -n " $1 " --force --grace-period=0"}' | sh
+watch kubectl get pods -n kubeflow (필수 인프라(MinIO) 회복 확인)
+
+# 문제의 Pod 삭제 (CrashLoopBackOff 상태 Pod 지정해 삭제)
+kubectl delete pod ml-pipeline-5f6bd5f566-zllr8 -n kubeflow
+
+# KServe 모델 서빙 재시작
+kubectl delete pods -l serving.kserve.io/inferenceservice=my-first-model
+watch kubectl get inferenceservice my-first-model (READY: True 상태 확인)

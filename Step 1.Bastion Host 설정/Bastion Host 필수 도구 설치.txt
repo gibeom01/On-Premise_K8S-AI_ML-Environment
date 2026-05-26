@@ -9,6 +9,11 @@
 1. sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE (eth0 통해 나가는 트래픽 NAT 적용 (eth0 부분은 실제 외부망 인터페이스 이름으로 변경))
 2. sudo iptables -t nat -L POSTROUTING -v -n (규칙 확인)
 
+# iptables 설정 영구 저장 (재부팅 시 자동 적용)
+
+1. sudo apt-get install iptables-persistent
+2. sudo netfilter-persistent save
+
 # Git 설치
 
 1. sudo apt update

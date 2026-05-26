@@ -85,6 +85,10 @@ spec:
 2. kubectl apply -f my-model.yaml
 3. kubectl get inferenceservice my-first-model -> READY 열이 True 확인
 
+---
+
+---
+
 # Predict API 테스트
 
 curl -X POST http://my-first-model.default.192.168.0.201.sslip.io/v1/models/my-first-model:predict \
@@ -95,3 +99,38 @@ curl -X POST http://my-first-model.default.192.168.0.201.sslip.io/v1/models/my-f
 -> -H "Content-Type: application/json"는 내가 지금부터 보내는 데이터는 JSON 형식이라고 알려주는 헤더.
 -> -d '{"instances": [[...]]}'는 모델에 던져줄 실제 테스트 데이터.
 -> 예상되는 결과값은 {"predictions": [1]}으로 1 또는 0, 2 등은 모델이 분류한 붓꽃의 종류(Class) 의미.
+
+---
+# KServe 카나리 배포 (10% 트래픽 쪼개기) 테스트
+
+1. cat > my-model-v2.yaml
+
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: my-first-model   # 이름은 기존과 똑같이 유지해야 합니다!
+  namespace: default
+spec:
+  predictor:
+    canaryTrafficPercent: 10  # 💡 마법의 단어: 새 모델로 트래픽 10%만 보내라!
+    serviceAccountName: kserve-minio-sa
+    sklearn:
+      # 💡 새로운 버전(v2)의 모델이 저장된 MinIO 경로로 수정합니다.
+      storageUri: s3://mlpipeline/v2/artifacts/tutorial-data-passing/d08d7f68-e1fe-4c86-a2ae-d701b97bec1f/train/878094a9-05ae-4c5c-a722-b5ffd2961e19
+
+2. kubectl apply -f my-model-v2.yaml
+3. kubectl get inferenceservice my-first-model -> READY 열이 True 확인
+
+# Loop로 20번 쏘고 파드 로그 까보기
+
+1. for i in {1..20}; do
+  curl -s -X POST http://my-first-model.default.192.168.0.201.sslip.io/v1/models/my-first-model:predict \
+       -H "Content-Type: application/json" \
+       -d '{"instances": [[6.8, 2.8, 4.8, 1.4]]}'
+  echo " <- $i 번째 요청 완료"
+  sleep 0.5
+done
+
+2. kubectl get pods | grep my-first-model
+3. kubectl logs 파드이름-00001 -c kserve-container | grep "POST /v1/models" | wc -l -> 21
+4. kubectl logs 파드이름-00002 -c kserve-container | grep "POST /v1/models" | wc -l -> 2

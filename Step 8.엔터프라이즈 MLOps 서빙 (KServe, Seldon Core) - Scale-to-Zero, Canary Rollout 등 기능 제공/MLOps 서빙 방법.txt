@@ -1,0 +1,97 @@
+# Istio Helm 저장소 추가 및 네임스페이스 생성
+
+1. helm repo add istio https://istio-release.storage.googleapis.com/charts (Istio 공식 Helm 저장소 추가)
+2. helm repo update
+
+# Istio 핵심 엔진 설치 (Base & Istiod)
+
+1. kubectl get crd | grep 'istio.io' | awk '{print $1}' | xargs -r kubectl delete crd (기존 Istio 잔해(CRD) 일괄 청소)
+2. helm install istio-base istio/base -n istio-system --set defaultRevision=default (Istio Base 설치)
+3. kubectl get clusterrole | grep istio | awk '{print $1}' | xargs -r kubectl delete clusterrole (Istio 관련 ClusterRole 삭제)
+4. kubectl get clusterrolebinding | grep istio | awk '{print $1}' | xargs -r kubectl delete clusterrolebinding (Istio 관련 Binding 삭제)
+5. kubectl get validatingwebhookconfiguration | grep istio | awk '{print $1}' | xargs -r kubectl delete validatingwebhookconfiguration (Istio 관련 웹훅(Webhook) 설정 삭제 1)
+6. kubectl get mutatingwebhookconfiguration | grep istio | awk '{print $1}' | xargs -r kubectl delete mutatingwebhookconfiguration (Istio 관련 웹훅(Webhook) 설정 삭제 2)
+7. helm install istiod istio/istiod -n istio-system --wait (Istiod 설치)
+8. helm install istio-ingressgateway istio/gateway -n istio-system --wait (Istio Ingress Gateway 설치)
+9. kubectl get svc -n istio-system (MetalLB가 부여한 외부 IP 확인)
+
+# Knative Serving CRD 및 Core 설치
+
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.13.0/serving-crds.yaml
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.13.0/serving-core.yaml
+
+# Istio와 Knative 연결 (통합 컨트롤러)
+
+kubectl apply -f https://github.com/knative/net-istio/releases/download/knative-v1.13.0/net-istio.yaml
+
+# Magic DNS 설정 (sslip.io)
+
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.13.0/serving-default-domain.yaml
+
+# cert-manager 설치
+
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+watch kubectl get pods -n cert-manager
+
+# KServe 본체 및 런타임 설치
+kubectl apply -f https://github.com/kserve/kserve/releases/download/v0.12.1/kserve.yaml (KServe CRD 및 컨트롤러 설치)
+kubectl apply -f https://github.com/kserve/kserve/releases/download/v0.12.1/kserve-runtimes.yaml (내장형 서빙 런타임 설치 (TensorFlow, PyTorch, SKLearn, XGBoost 등을 기본 지원하게 해줌))
+
+# MinIO 출입증(Secret/SA) 만들기
+
+1. cat > minio-secret.yaml
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-secret
+  annotations:
+    # 💡 주의: kubeflow 네임스페이스에 있는 minio 서비스 이름과 포트에 맞게 수정해야 할 수 있습니다.
+    serving.kserve.io/s3-endpoint: minio-service.kubeflow.svc.cluster.local:9000
+    serving.kserve.io/s3-usehttps: "0" # 사설망이므로 HTTP 사용
+    serving.kserve.io/s3-region: us-east-1
+type: Opaque
+stringData:
+  # 💡 MinIO 접속 ID와 비밀번호를 입력하세요. (기본값인 경우가 많습니다)
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: minio123
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-minio-sa
+secrets:
+- name: minio-secret
+
+2. kubectl apply -f minio-secret.yaml
+
+# InferenceService 배포
+
+1. cat > my-model.yaml
+
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: my-first-model
+  namespace: default
+spec:
+  predictor:
+    serviceAccountName: kserve-minio-sa
+    sklearn: # 💡 훈련하신 모델이 텐서플로우라면 tensorflow: 로 변경하세요.
+      # 💡 로그에 찍혔던 MinIO 모델 폴더 경로를 정확히 입력하세요.
+      # (주의: 파일명.pkl 이 아닌, 파일이 들어있는 폴더 경로까지만 입력해야 합니다!)
+      storageUri: s3://mlpipeline/v2/artifacts/tutorial-data-passing/d08d7f68-e1fe-4c86-a2ae-d701b97bec1f/train/878094a9-05ae-4c5c-a722-b5ffd2961e19
+
+2. kubectl apply -f my-model.yaml
+3. kubectl get inferenceservice my-first-model -> READY 열이 True 확인
+
+# Predict API 테스트
+
+curl -X POST http://my-first-model.default.192.168.0.201.sslip.io/v1/models/my-first-model:predict \
+     -H "Content-Type: application/json" \
+     -d '{"instances": [[6.8, 2.8, 4.8, 1.4]]}'
+
+-> URL 엔드포인트, KServe 사용하는 공식 API 규칙으로 도메인 뒤에 버전 명시, 모델 이름과 :predict 액션 지정하여 데이터 출력.
+-> -H "Content-Type: application/json"는 내가 지금부터 보내는 데이터는 JSON 형식이라고 알려주는 헤더.
+-> -d '{"instances": [[...]]}'는 모델에 던져줄 실제 테스트 데이터.
+-> 예상되는 결과값은 {"predictions": [1]}으로 1 또는 0, 2 등은 모델이 분류한 붓꽃의 종류(Class) 의미.

@@ -1,0 +1,68 @@
+Trivy Operator 구축 (실시간 취약점 스캐너)
+
+# Aqua Security Helm 저장소 추가
+1. helm repo add aqua https://aquasecurity.github.io/helm-charts/
+2. helm repo update
+
+# trivy-system 네임스페이스 생성 및 배포
+1. helm install trivy-operator aqua/trivy-operator \
+  --namespace trivy-system \
+  --create-namespace \
+  --set="trivy.ignoreUnfixed=true"
+
+2. 스캔 주기 1시간(3600s) 정도 여유롭게 조정
+helm upgrade trivy-operator aqua/trivy-operator \
+  --namespace trivy-system \
+  --set="trivy.scanInterval=3600s"
+
+3. 기본 설정 모든 네임스페이스 스캔하지만, 중요한 mlflow나 default 정도만 스캔하도록 설정
+helm upgrade trivy-operator aqua/trivy-operator \
+  --namespace trivy-system \
+  --set="trivyOperator.scanJobs.namespaces={default,mlflow}"
+
+# mlflow 네임스페이스의 취약점 요약 보고서 보기
+1. watch kubectl get pods -n trivy-system
+2. kubectl get vulnerabilityreports -n mlflow
+3. kubectl get vulnerabilityreports -n mlflow -o yaml (MLflow 서버의 보안 리포트 YAML 형태로 자세히 보기)
+4. kubectl get vulnerabilityreports -A (클러스터 전체의 취약점 한번에 확인)
+
+---
+
+Kyverno 구축 (K8s 네이티브 정책 엔진)
+
+# Kyverno Helm 저장소 추가
+1. helm repo add kyverno https://kyverno.github.io/kyverno/
+2, helm repo update
+
+# kyverno 네임스페이스 생성 및 배포
+1. helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+2. watch kubectl get pods -n kyverno
+
+# Policy 적용 및 차단 테스트
+1. cat > disallow-latest-tag.yaml
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  # 위반 시 파드 생성을 아예 차단 (Enforce) 할지, 경고 로그만 남길지 (Audit) 설정
+  validationFailureAction: Enforce
+  rules:
+  - name: require-image-tag
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    validate:
+      message: "보안 위반! 이미지 태그로 'latest'를 사용하거나 태그를 생략하는 것은 금지되어 있습니다. 정확한 버전을 명시하세요!"
+      pattern:
+        spec:
+          containers:
+          - image: "*:?*"
+            # image 속성이 ':latest'로 끝나는 것을 부정(차단)
+            =(image): "!*:latest"
+
+2. kubectl apply -f disallow-latest-tag.yaml
+3. kubectl run bad-nginx --image=nginx:latest -> K8s가 배포 진행하지 않고 빨간색 에러 메시지 출력

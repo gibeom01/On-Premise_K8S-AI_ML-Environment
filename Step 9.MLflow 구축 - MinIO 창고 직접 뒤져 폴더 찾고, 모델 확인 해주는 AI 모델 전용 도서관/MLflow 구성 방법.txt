@@ -1,0 +1,109 @@
+# MinIO Browser에서 버킷 생성
+
+1. kubectl port-forward svc/minio-service -n kubeflow 9000:9000 --address 0.0.0.0
+2. 브라우저 -> http://192.168.0.20:9000 접속 -> 초기 ID/PW(minio / minio123) 로그인.
+3. 화면 우측 하단 빨간색 원형 더하기(+) 버튼 선택 -> Create Bucket 선택 -> mlflow 입력 후 생성.
+4. 추가적으로 Console 만드는 방법은 kubectl exec -it deployment/minio -n kubeflow -- mkdir /data/mlflow
+
+# MLflow UI 접속
+
+1. cat > mlflow-server.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+      - name: mlflow
+        # 파이썬 기반 MLflow 공식 내장 이미지 사용
+        image: ghcr.io/mlflow/mlflow:v2.10.2
+        # 💡서버 실행 전 DB 드라이버(psycopg2)와 S3 드라이버(boto3)를 먼저 설치합니다.
+        command:
+        - /bin/sh
+        - -c
+        - "pip install psycopg2-binary boto3 && mlflow server --host=0.0.0.0 --port=5000 --backend-store-uri=postgresql://postgres:mlflow123@mlflow-db-postgresql.mlflow.svc.cluster.local:5432/mlflow --default-artifact-root=s3://mlflow/"
+        ports:
+        - containerPort: 5000
+        env:
+        # 💡 기존 Kubeflow MinIO와 통신하기 위한 환경변수 설정
+        - name: MLFLOW_S3_ENDPOINT_URL
+          value: "http://minio-service.kubeflow.svc.cluster.local:9000"
+        - name: AWS_ACCESS_KEY_ID
+          value: "minio"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "minio123"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: mlflow
+spec:
+  # 💡 Step 6에서 구축하신 MetalLB를 활용해 외부 IP를 직접 발급받습니다!
+  type: LoadBalancer 
+  selector:
+    app: mlflow
+  ports:
+  - port: 5000
+    targetPort: 5000
+
+2. kubectl apply -f mlflow-server.yaml
+3. kubectl get pods -n mlflow 전부 Running 확인 -> 브라우저 -> http://192.168.0.20:32178 접속.
+
+---
+
+# 테스트용 라이브러리 설치 -> 실무에서는 파일 Giuhub에서 끌어 오도록 구성.
+
+1. apt install python3-venv (가상 환경 패키지 설치)
+2. cat << 'EOF' > test_mlflow.py
+import mlflow
+import os
+
+# 💡택배 기사(스크립트)에게 MinIO 출입증과 창고 주소를 쥐여줍니다.
+os.environ["AWS_ACCESS_KEY_ID"] = "minio"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "minio123"
+os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://127.0.0.1:9000"
+
+# 1. 방금 구축한 MLflow 서버 주소로 타겟 설정 (MetalLB IP 또는 마스터IP:32178)
+mlflow.set_tracking_uri("http://192.168.0.20:32178") 
+
+# 2. 실험(Experiment) 방 이름 만들기
+mlflow.set_experiment("SRE_Infra_Test")
+
+# 3. 데이터 기록 시작!
+with mlflow.start_run():
+    print("🚀 MLflow 서버로 데이터를 전송합니다...")
+
+    # [테스트 1] DB 연동 테스트: 파라미터(설정값)와 메트릭(결과값) 기록
+    mlflow.log_param("Algorithm", "RandomForest")
+    mlflow.log_param("Learning_Rate", 0.05)
+    
+    mlflow.log_metric("Accuracy", 0.98)
+    mlflow.log_metric("Loss", 0.02)
+
+    # [테스트 2] MinIO 연동 테스트: 가짜 모델 파일(Artifact) 만들어서 보내기
+    with open("dummy_model.txt", "w") as f:
+        f.write("이 파일이 보인다면 MinIO S3 연동이 100% 완벽하게 성공한 것입니다!")
+    
+    mlflow.log_artifact("dummy_model.txt")
+
+    print("✅ 전송 완료! 브라우저에서 MLflow UI를 확인해보세요.")
+EOF
+
+3. ls -la | grep test_mlflow (파일 확인)
+4. source mlflow_test/bin/activate (가상 환경으로 들어가기 -> 프롬프트 앞에 (mlflow_test)가 생성됨)
+5. pip install mlflow boto3 (파이썬 패키지 설치)
+6. python test_mlflow.py (파이썬 스크립트 실행)
+7. MLflow UI 접속 -> 성공화면 확인.
+8. deactivate (테스트 후 원래대로 복귀)

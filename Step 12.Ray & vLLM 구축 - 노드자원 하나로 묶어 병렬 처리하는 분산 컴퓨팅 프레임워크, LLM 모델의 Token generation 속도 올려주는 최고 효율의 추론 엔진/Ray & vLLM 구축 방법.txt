@@ -1,0 +1,208 @@
+# KubeRay Helm 저장소 추가 및 Operator 설치
+1. helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+2. helm repo update
+3. helm install kuberay-operator kuberay/kuberay-operator --namespace ray-system --create-namespace
+
+# Ray Cluster 배포 (작업 반장 1명, 워커 2명 생성)
+helm install raycluster kuberay/ray-cluster --namespace ray-system
+
+---
+
+# HuggingFace Token 발급
+1. 브라우저 -> https://huggingface.co/ 접속 -> meta-llama/Meta-Llama-3-8B-Instruct 검색.
+2. You need to agree to share your contact information to access this model 맨 아래 -> 이름, 소속, 직무 등을 입력 -> Submit.
+3. 화면 우측 상단 본인 프로필 아이콘 선택 -> Settings -> Access Tokens -> + Create new token 선택.
+4. 이름 적고, Token type은 반드시 Read 설정한 후 생성 -> hf_...로 시작하는 긴 문자열이 토큰.
+
+---
+
+# 허깅페이스 라이브러리 설치
+1. source mlflow_test/bin/activate (가상 환경으로 들어가기 -> 프롬프트 앞에 (mlflow_test)가 생성됨)
+2. pip install huggingface_hub
+3. cat > download_llama.py
+
+from huggingface_hub import snapshot_download
+
+# 💡 아까 복사해둔 허깅페이스 토큰을 여기에 넣으세요!
+HF_TOKEN = ""
+
+# 💡 모델이 다운로드될 폴더 이름 지정
+REPO_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+LOCAL_DIR = "./tiny-llama-1.1b"
+
+print(f"🚀 {REPO_ID} 다운로드를 시작합니다... (약 2~3GB)")
+
+try:
+    snapshot_download(
+        repo_id=REPO_ID,
+        local_dir=LOCAL_DIR,
+        token=HF_TOKEN,
+        # 실무 팁: 용량 낭비를 막기 위해, 구형 가중치 파일(.pth)은 무시하고 
+        # 최신 포맷인 .safetensors만 다운로드하도록 필터링합니다.
+        ignore_patterns=["*.pth", "*.pt", "original/*"] 
+    )
+    print(f"\n✅ 다운로드 완료! 모든 파일이 '{LOCAL_DIR}' 폴더에 저장되었습니다.")
+except Exception as e:
+    print(f"\n❌ 다운로드 실패: {e}")
+
+4. python download_llama.py
+
+---
+
+# Head 파드 접속 및 테스트
+1. kubectl get pods -n ray-system
+2. kubectl exec -it raycluster-kuberay-head-jjjtj -n ray-system -- bash
+3. cat > test_ray_cpu.py
+
+import ray
+import socket
+import time
+
+# 1. Ray 클러스터에 연결 (Head 파드 내부이므로 자동으로 전체 클러스터를 인식합니다)
+ray.init()
+
+# 💡 [마법의 핵심] @ray.remote 데코레이터!
+# 이 표시가 붙은 함수는 내 컴퓨터에서 도는 게 아니라, 클러스터의 빈 워커 노드로 날아가서 실행됩니다.
+@ray.remote
+def distributed_cpu_task(task_id):
+    # 1. CPU 연산 시뮬레이션 (1000만 번 더하기)
+    sum_val = sum([i for i in range(10000000)])
+    
+    # 2. 이 연산을 지금 어떤 파드(워커)가 하고 있는지 확인
+    pod_name = socket.gethostname()
+    
+    return f"✅ [작업 {task_id:02d}] 완료! (실행된 곳: {pod_name})"
+
+print("\n🚀 Ray 분산 처리 클러스터 테스트를 시작합니다...")
+# 클러스터 전체에 흩어진 총 CPU 코어 개수를 확인합니다.
+total_cpus = int(ray.cluster_resources().get('CPU', 0))
+print(f"🔥 현재 K8s 클러스터에서 총 {total_cpus}개의 CPU 코어를 병렬로 사용할 수 있습니다!\n")
+
+start_time = time.time()
+
+# 3. 20개의 무거운 작업을 워커 노드들에게 동시에 던집니다! (비동기 병렬 처리)
+# 함수 뒤에 .remote()를 붙이면 작업을 던지고 즉시 다음 줄로 넘어갑니다.
+futures = [distributed_cpu_task.remote(i) for i in range(20)]
+
+# 4. 각 워커들이 연산을 끝낼 때까지 기다렸다가 결과를 한 번에 싹 긁어옵니다.
+results = ray.get(futures)
+
+# 결과 출력
+for r in results:
+    print(r)
+
+end_time = time.time()
+print(f"\n⏱️ 총 소요 시간: {end_time - start_time:.2f}초")
+print("🎉 클러스터 분산 처리가 완벽하게 성공했습니다!")
+
+4. python test_ray_cpu.py (분산 처리의 마법 실행 및 결과 확인)
+5. deactivate (테스트 후 원래대로 복귀)
+
+# 개념 정리
+1. 클러스터 자원 통합: 총 O개의 CPU 코어를 병렬로 사용할 수 있습니다! 메시지가 뜨며 8s가 하나의 거대한 슈퍼컴퓨터처럼 묶인 것.
+2. 동시다발적 실행 장소: (실행된 곳: raycluster-kuberay-worker-xxxx) 와 같이 서로 다른 워커 파드들의 이름이 마구 섞여서 출력 -> 여러 워커들이 남는 CPU를 이용해 작업을 낚아채서 동시에 연산했다는 증거.
+3. 압도적인 속도: @ray.remote 없이 그냥 돌리면 20 ~ 1번 차례대로 계산해 시간이 오래 걸림 -> Ray가 CPU 코어 수만큼 동시에 병렬 계산을 해 시간 단축. 
+
+---
+
+# LLM 서빙용 KServe 설계도 작성
+1. kubectl delete inferenceservice tiny-llama (문제의 KServe 서비스 깔끔하게 삭제)
+2. cat > tiny-llama.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tiny-llama-pure
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tiny-llama
+  template:
+    metadata:
+      labels:
+        app: tiny-llama
+    spec:
+      volumes:
+      - name: model-volume
+        emptyDir: {}
+      
+      initContainers:
+      - name: downloader
+        image: index.docker.io/kserve/huggingfaceserver@sha256:a4cd63fc95e7d9fc097138c5e5721029a9264a583c6583a772a963db0d48bcf9
+        command: ["python", "-c"]
+        args:
+        - |
+          import os
+          from huggingface_hub import snapshot_download
+          print("🚀 허깅페이스에서 진짜 원본 모델 다운로드를 시작합니다...")
+          snapshot_download(repo_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0", local_dir="/mnt/models", local_dir_use_symlinks=False)
+          print("✅ 원본 파일 다운로드 완료! 본대(엔진)를 호출합니다.")
+        volumeMounts:
+        - name: model-volume
+          mountPath: /mnt
+
+      containers:
+      - name: llm-engine
+        image: index.docker.io/kserve/huggingfaceserver@sha256:a4cd63fc95e7d9fc097138c5e5721029a9264a583c6583a772a963db0d48bcf9
+        # 💡 핵심 추가: 엔진에게 이름과 모델이 있는 위치를 직접 주입합니다!
+        args:
+        - --model_name
+        - tiny-llama
+        - --model_dir
+        - /mnt/models
+        resources:
+          requests:
+            cpu: "1"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        env:
+        - name: MLSERVER_MODEL_HUGGINGFACE_TASK
+          value: text-generation
+        volumeMounts:
+        - name: model-volume
+          mountPath: /mnt
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tiny-llama-service
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: tiny-llama
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+
+3. kubectl apply -f tiny-llama.yaml
+4. watch kubectl get pods
+5. kubectl logs -l app=tiny-llama -c downloader -f (downloader가 모델 받아오고 있는 로그 실시간으로 확인)
+6. kubectl logs -l app=tiny-llama -c llm-engine -f (본대의 엔진 기동 로그)
+
+# "kubectl logs -l app=tiny-llama -c llm-engine -f" 출력값 해석
+1. HTTP/1.1 200 OK: curl의 요청을 엔진이 완벽하게 이해했고, 모델 추론을 거쳐, 에러 없이 결과를 반환했다는 뜻.
+
+---
+
+# API 호출 테스트 -> 새 터미널을 열고 진행
+1. curl -X POST "http://localhost:30080/v2/models/tiny-llama/generate" \
+-H "Content-Type: application/json" \
+-d '{
+  "text_input": "Hello, what is your name?",
+  "parameters": {
+    "max_new_tokens": 50
+  }
+}'
+
+# 결과 출력값 해석
+1. 프롬프트 팁: TinyLlama는 <|user|>와 <|assistant|>라는 특수한 템플릿 기호를 사용해야 대답을 훨씬 잘함.
+2. TinyLlama 모델은 기본적으로 "Text Generation". "Hello, what is your name?" 프로프트 던지면 AI가 이것을 '영어 회화 첫 줄'이라고 상황 인식 후, 그 뒤에 이어질 법한 자연스러운 대화 작성.
+3. 뒤에 붙은 수많은 logprob, id, text 덩어리들은 AI의 '사고 과정(뇌파)' 그대로 보여주는 데이터 -> AI는 글자 뱉을 때 한 글자씩 확률 계산해 "J" 다음에 "ane"이 나올 확률을 수치화(logprob: 0.0 등)해서 엔진이 가장 확률이 높은 단어들을 조립한 흔적.

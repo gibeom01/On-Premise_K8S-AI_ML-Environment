@@ -1,0 +1,282 @@
+★ worker node들 NotReady 되거나 Pod CrashLoopBackOff, Evicted 이슈 발생 시 ★
+1. kubectl get nodes / kubectl get pods -o wide 상태 확인.
+2. df -h / 디스크 용량 확인 후 85% 넘으면 -> crictl rmi --prune / journalctl --vacuum-time=1d / du -sh 공간 확보.
+3. 해당 노드 접속 후 -> sudo systemctl restart containerd / sudo systemctl restart kubelet
+4. 해당 노드 reboot -> sudo crictl ps | grep kube-apiserver로 kube-apiserver 컨테이너가 다시 살아나는지 확인. 
+5. journalctl -u kubelet -n 50 --no-pager (에러 로그 확인 가능)
+
+---
+
+# 모델 파일 옮기기 (worker 노드들)
+1. mkdir -p /opt/models/tiny-llama-1.1b
+2. cd /opt/models/tiny-llama-1.1b
+
+# 필수 모델 파일 다운로드 (worker 노드들)
+1. sudo wget -nc https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/config.json
+2. sudo wget -nc --show-progress https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors
+3. sudo wget -nc https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json
+4. sudo wget -nc https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer_config.json
+5. sudo wget -nc https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/special_tokens_map.json
+
+# CPU 전용 KServe 엔진 이미지 다운, 확인 (worker 노드)
+1. sudo crictl pull index.docker.io/kserve/huggingfaceserver@sha256:a4cd63fc95e7d9fc097138c5e5721029a9264a583c6583a772a963db0d48bcf9
+2. sudo crictl images | grep huggingface
+
+# AI 추론 엔진 배포 (HostPath 방식)
+1. cat > tiny-llama-hostpath.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tiny-llama-hostpath
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tiny-llama
+  template:
+    metadata:
+      labels:
+        app: tiny-llama
+    spec:
+      nodeName: worker02 # 스케줄링 강제 지정
+      containers:
+      - name: llm-engine
+	# worker 02 다운받은 이미지 지정
+        image: index.docker.io/kserve/huggingfaceserver@sha256:a4cd63fc95e7d9fc097138c5e5721029a9264a583c6583a772a963db0d48bcf9
+        args:
+        - --model_name
+        - tiny-llama
+        - --model_dir
+        - /models
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        ports:
+        - containerPort: 8080
+      volumes:
+      - name: model-storage
+        hostPath:
+          path: /opt/models/tiny-llama-1.1b # worker02의 물리 디스크 지정
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tiny-llama-service
+spec:
+  type: NodePort
+  selector:
+    app: tiny-llama
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+EOF
+
+2. kubectl apply -f tiny-llama-hostpath.yaml
+
+# V1 API 호출 및 부하 테스트
+1. sudo crictl ps -a | grep tiny-llama (-a 옵션 죽어있는 컨테이너 목록까지 전부 출력)
+2. sudo crictl logs -f 14bf2fdf58529 (컨테이너 로그 확인)
+3. kubectl logs -l app=tiny-llama -c llm-engine -f (API 서버 기동 최종 확인)
+4. curl -X POST "http://localhost:30080/v2/models/tiny-llama/generate" \
+-H "Content-Type: application/json" \
+-d '{
+  "text_input": "Hello, what is your name?",
+  "parameters": {
+    "max_new_tokens": 50
+  }
+}'
+4. API 호출 성공 시 kubectl delete -f tiny-llama-hostpath.yaml
+
+---
+
+# 원본 스토리지 인프라 준비 (MinIO)
+1. kubectl port-forward svc/minio-service -n kubeflow 9000:9000 --address 0.0.0.0 (UI 접속 위한 포트 포워딩)
+2. cat > minio-secret.yaml
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-secret
+  annotations:
+    # 💡 주의: kubeflow 네임스페이스에 있는 minio 서비스 이름과 포트에 맞게 수정해야 할 수 있습니다.
+    serving.kserve.io/s3-endpoint: minio-service.kubeflow.svc.cluster.local:9000
+    serving.kserve.io/s3-usehttps: "0" # 사설망이므로 HTTP 사용
+    serving.kserve.io/s3-region: us-east-1
+type: Opaque
+stringData:
+  # 💡 MinIO 접속 ID와 비밀번호를 입력하세요. (기본값인 경우가 많습니다)
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: minio123
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-minio-sa
+secrets:
+- name: minio-secret
+
+3. kubectl apply -f minio-secret.yaml
+
+# MinIO 클라이언트(mc) 받기 (worker 노드)
+1. curl -LO https://dl.min.io/client/mc/release/linux-amd64/mc
+2. chmod +x mc
+3. sudo mv mc /usr/local/bin/
+
+# MinIO에 데이터 업로드 (worker 노드)
+1. mc alias set myminio http://10.111.139.25:9000 minio minio123
+2. mc mb myminio/vllm
+3. mc cp -r /opt/models/tiny-llama-1.1b myminio/vllm/
+
+---
+
+# Fluid 컨트롤러 설치
+1. helm repo add fluid https://fluid-cloudnative.github.io/charts
+2. helm install fluid fluid/fluid --create-namespace --namespace fluid-system
+
+# Dataset 및 AlluxioRuntime 정의 (핵심 설계도)
+1. cat > dataset-alluxio.yaml
+
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: tiny-llama-dataset		# 이 이름이 곧 PVC의 이름
+spec:
+  mounts:
+    - mountPoint: s3://vllm/tiny-llama-1.1b/	# 💡 원본은 안전한 원격 MinIO에 존재
+      name: tiny-llama
+      options:
+        # 💡 아마존 S3가 아닌 사설 MinIO IP 직통 연결 및 DNS 버그 차단 옵션
+        alluxio.underfs.s3.endpoint: "http://10.111.139.25:9000"	# 💡 Alluxio 전용 엔드포인트 문법
+        alluxio.underfs.s3.disable.dns.buckets: "true"			# 💡 가상 호스트(도메인) 버그 방지
+      encryptOptions:
+        - name: aws.accessKeyId						# 💡 Alluxio 전용 자격증명 문법
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: AWS_ACCESS_KEY_ID
+        - name: aws.secretKey
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: AWS_SECRET_ACCESS_KEY
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: AlluxioRuntime
+metadata:
+  name: tiny-llama-dataset
+spec:
+  replicas: 1
+  tieredstore:
+    levels:
+      - mediumtype: HDD      # 💡 노드의 RAM을 터뜨리지 않고(OOM 방지) 디스크를 캐시로 사용
+        path: /var/lib/fluid
+        quota: 4Gi
+        high: "0.95"
+        low: "0.7"
+
+2. kubectl apply -f dataset-alluxio.yaml
+
+# 데이터 예열 (DataLoad / Pre-warming) 배포
+1. cat > dataload.yaml
+
+apiVersion: data.fluid.io/v1alpha1
+kind: DataLoad
+metadata:
+  name: tiny-llama-preload
+spec:
+  dataset:
+    name: tiny-llama-dataset
+    namespace: default
+
+2. kubectl apply -f dataload.yaml
+
+---
+
+# AI 엔진 최종 Deployment & Service 배포 (Decoupling)
+1. cat > tiny-llama.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tiny-llama-final
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tiny-llama
+  template:
+    metadata:
+      labels:
+        app: tiny-llama
+    spec:
+      containers:
+      - name: llm-engine
+        image: index.docker.io/kserve/huggingfaceserver@sha256:a4cd63fc95e7d9fc097138c5e5721029a9264a583c6583a772a963db0d48bcf9
+        args:
+        - --model_name
+        - tiny-llama
+        - --model_dir
+        - /models/tiny-llama		# 💡 Fluid 서브 경로 함정 회피 (/models 하위 폴더 지정)
+        env:
+        - name: MAX_CONCURRENCY
+          value: "1"				# 💡 파이썬 워커 스레드를 제한하여 OOM 방지
+        - name: OMP_NUM_THREADS
+          value: "1"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "1"         		# 💡 노드 스케줄링 실패를 막기 위해 CPU 요구량 다이어트!
+            memory: "4Gi"
+          limits:
+            cpu: "2"
+            memory: "8Gi"
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: tiny-llama-dataset	# 💡 물리 디스크(HostPath) 대신 Fluid가 만든 캐시 PVC 연결
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tiny-llama-service
+spec:
+  type: NodePort
+  selector:
+    app: tiny-llama
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+
+kubectl apply -f tiny-llama.yaml
+
+# 최종 API 호출 및 부하 테스트
+1. kubectl logs -l app=tiny-llama -c llm-engine -f (API 서버 기동 최종 확인)
+2. while true; do
+  # API 찌르기 (실패하면 에러 메시지 없이 무시)
+  RESPONSE=$(curl -s -X POST "http://localhost:30080/v2/models/tiny-llama/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text_input": "Hello, what is your name?",
+    "parameters": {
+      "max_new_tokens": 50
+    }
+  }')
+  
+  # 응답에 내용이 있으면 성공으로 간주하고 출력 후 종료!
+  if [ -n "$RESPONSE" ]; then
+    echo -e "\n🎉 [성공] AI가 응답을 시작했습니다!\n"
+    echo "$RESPONSE"
+    break
+  fi
+  
+  echo "🤖 AI 엔진 뇌(가중치) 다운로드 및 조립 중... (3초 대기)"
+  sleep 3
+done
